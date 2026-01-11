@@ -70,6 +70,20 @@ export class AllExceptionsFilter implements ExceptionFilter {
       };
     }
 
+    if (exception instanceof Error && 'code' in exception) {
+      const pgError = exception as Error & { code: string };
+
+      if (['40P01', '55P03', '57014'].includes(pgError.code)) {
+        return {
+          status: HttpStatus.SERVICE_UNAVAILABLE,
+          errorResponse: {
+            code: ErrorCodes.ERROR_RETRY,
+            message: 'Service temporarily unavailable, please retry',
+          },
+        };
+      }
+    }
+
     return {
       status: HttpStatus.INTERNAL_SERVER_ERROR,
       errorResponse: {
@@ -84,6 +98,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
         return ErrorCodes.ERROR_INVALID_INPUT;
       case HttpStatus.NOT_FOUND:
         return ErrorCodes.ERROR_USER_NOT_FOUND;
+      case HttpStatus.SERVICE_UNAVAILABLE:
+        return ErrorCodes.ERROR_RETRY;
       default:
         return ErrorCodes.ERROR_INTERNAL;
     }
