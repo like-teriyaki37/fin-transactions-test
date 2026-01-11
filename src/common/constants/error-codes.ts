@@ -1,0 +1,8 @@
+export const ErrorCodes = {
+  ERROR_INSUFFICIENT_BALANCE: 'ERROR_INSUFFICIENT_BALANCE',
+  ERROR_USER_NOT_FOUND: 'ERROR_USER_NOT_FOUND',
+  ERROR_INVALID_INPUT: 'ERROR_INVALID_INPUT',
+  ERROR_INTERNAL: 'ERROR_INTERNAL',
+} as const;
+
+export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
