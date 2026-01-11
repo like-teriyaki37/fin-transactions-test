@@ -26,8 +26,8 @@ export async function up(knex: Knex): Promise<void> {
 
     table.unique(['provider_id', 'external_id']);
 
-    table.index('user_id');
-    table.index('created_at');
+    table.index(['user_id'], 'idx_transactions_user_id', { storageEngineIndexType: 'hash' });
+    table.index(['created_at'], 'idx_transactions_created_at');
   });
 }
 
