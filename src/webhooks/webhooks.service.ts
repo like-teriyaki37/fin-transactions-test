@@ -1,66 +1,43 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { TransactionService } from '../database/transaction.service';
+import { Injectable, Logger, NotFoundException, Inject } from '@nestjs/common';
+import { KNEX_CONNECTION } from '@willsoto/nestjs-objection';
+import { Knex } from 'knex';
+import { ConfigService } from '@nestjs/config';
 import { UsersRepository } from '../users';
 import { TransactionsRepository } from '../transactions';
 import { InsufficientBalanceException } from '../common/exceptions';
-import { TransactionType } from '../common/constants';
+import { TransactionType, PgErrorCodes } from '../common/constants';
 import { WebhookTransactionDto, WebhookResponseDto } from './dto';
 
 @Injectable()
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
+  private readonly statementTimeout: number;
+  private readonly lockTimeout: number;
 
   constructor(
-    private readonly transactionService: TransactionService,
+    @Inject(KNEX_CONNECTION) private readonly knex: Knex,
+    private readonly configService: ConfigService,
     private readonly usersRepository: UsersRepository,
     private readonly transactionsRepository: TransactionsRepository,
-  ) { }
+  ) {
+    this.statementTimeout = this.configService.get<number>('database.statementTimeout', 200);
+    this.lockTimeout = this.configService.get<number>('database.lockTimeout', 100);
+  }
 
   async handleWebhook(dto: WebhookTransactionDto): Promise<WebhookResponseDto> {
     this.logger.debug(
       `Processing webhook: providerId=${dto.providerId}, externalId=${dto.externalId}, userId=${dto.userId}, type=${dto.type}, amount=${dto.amount}`,
     );
 
-    return this.transactionService.withTransaction(async (trx) => {
-      this.logger.debug('Attempting to insert transaction');
-      const newTransaction = await this.transactionsRepository.insertWithConflict(
-        trx,
-        {
-          userId: dto.userId,
-          externalId: dto.externalId,
-          providerId: dto.providerId,
-          type: dto.type,
-          amount: dto.amount.toFixed(2),
-        },
-      );
+    const trx = await this.knex.transaction();
 
-      if (!newTransaction) {
-        this.logger.debug('Duplicate transaction detected, fetching existing');
-        const existing = await this.transactionsRepository.findByProviderAndExternalId(
-          trx,
-          dto.providerId,
-          dto.externalId,
-        );
+    try {
+      // Set isolation level and timeouts
+      await trx.raw('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+      await trx.raw(`SET LOCAL statement_timeout = '${this.statementTimeout}ms'`);
+      await trx.raw(`SET LOCAL lock_timeout = '${this.lockTimeout}ms'`);
 
-        const user = await this.usersRepository.findByIdForUpdate(trx, dto.userId);
-        const balance = parseFloat(user?.balance ?? '0');
-
-        this.logger.debug(
-          `Returning duplicate response: transactionId=${existing!.transactionId}`,
-        );
-        return {
-          transactionId: existing!.transactionId,
-          userId: dto.userId,
-          balance,
-          isProcessed: false,
-          message: 'Transaction already processed',
-        };
-      }
-
-      this.logger.debug(
-        `Transaction inserted: transactionId=${newTransaction.transactionId}`,
-      );
-
+      // First, lock the user row to ensure they exist and get current balance
       this.logger.debug(`Acquiring lock on user ${dto.userId}`);
       const user = await this.usersRepository.findByIdForUpdate(trx, dto.userId);
 
@@ -69,34 +46,84 @@ export class WebhooksService {
         throw new NotFoundException(`User ${dto.userId} not found`);
       }
 
-      const currentBalance = parseFloat(user.balance);
-      const amount = dto.amount;
-      const balanceChange = dto.type === TransactionType.CREDIT ? amount : -amount;
-      const newBalance = currentBalance + balanceChange;
+      this.logger.debug('Attempting to insert transaction');
 
-      this.logger.debug(
-        `Balance calculation: current=${currentBalance}, change=${balanceChange}, new=${newBalance}`,
-      );
+      try {
+        const newTransaction = await this.transactionsRepository.insert(trx, {
+          userId: dto.userId,
+          externalId: dto.externalId,
+          providerId: dto.providerId,
+          type: dto.type,
+          amount: dto.amount.toFixed(2),
+        });
 
-      if (newBalance < 0) {
+        this.logger.debug(`Transaction inserted: transactionId=${newTransaction.transactionId}`);
+
+        // Calculate delta for DB-level arithmetic (avoids floating point errors)
+        const delta = dto.type === TransactionType.CREDIT
+          ? dto.amount.toFixed(2)
+          : (-dto.amount).toFixed(2);
+
+        this.logger.debug(`Updating balance atomically: userId=${dto.userId}, delta=${delta}`);
+
+        const updateResult = await this.usersRepository.updateBalanceAtomic(trx, dto.userId, delta);
+
+        if (!updateResult.success) {
+          this.logger.debug(
+            `Insufficient balance: required=${dto.amount}, available=${user.balance}`,
+          );
+          throw new InsufficientBalanceException();
+        }
+
+        const newBalance = parseFloat(updateResult.newBalance!);
+
+        await trx.commit();
+
         this.logger.debug(
-          `Insufficient balance: required=${amount}, available=${currentBalance}`,
+          `Transaction completed: transactionId=${newTransaction.transactionId}, newBalance=${newBalance}`,
         );
-        throw new InsufficientBalanceException();
+
+        return {
+          transactionId: newTransaction.transactionId,
+          userId: dto.userId,
+          balance: newBalance,
+          isProcessed: true,
+        };
+      } catch (error) {
+        // Check for unique constraint violation (duplicate transaction)
+        if (error instanceof Error && 'code' in error && (error as { code: string }).code === PgErrorCodes.UNIQUE_VIOLATION) {
+          this.logger.debug('Duplicate transaction detected');
+
+          // Rollback the aborted transaction
+          await trx.rollback();
+
+          // Fetch existing transaction and current user balance outside transaction
+          const existing = await this.transactionsRepository.findByProviderAndExternalId(
+            dto.providerId,
+            dto.externalId,
+          );
+
+          const currentUser = await this.usersRepository.findById(dto.userId);
+          const balance = parseFloat(currentUser?.balance ?? '0');
+
+          this.logger.debug(`Returning duplicate response: transactionId=${existing?.transactionId}`);
+
+          return {
+            transactionId: existing!.transactionId,
+            userId: dto.userId,
+            balance,
+            isProcessed: false,
+            message: 'Transaction already processed',
+          };
+        }
+        throw error;
       }
-
-      this.logger.debug(`Updating user ${dto.userId} balance to ${newBalance}`);
-      await this.usersRepository.updateBalance(trx, dto.userId, newBalance.toFixed(2));
-
-      this.logger.debug(
-        `Transaction completed: transactionId=${newTransaction.transactionId}, newBalance=${newBalance}`,
-      );
-      return {
-        transactionId: newTransaction.transactionId,
-        userId: dto.userId,
-        balance: newBalance,
-        isProcessed: true,
-      };
-    });
+    } catch (error) {
+      // Only rollback if transaction is still active
+      if (!trx.isCompleted()) {
+        await trx.rollback();
+      }
+      throw error;
+    }
   }
 }

@@ -4,7 +4,6 @@ import { ObjectionModule } from '@willsoto/nestjs-objection';
 import { knexSnakeCaseMappers } from 'objection';
 import { User } from './models/user.model';
 import { Transaction } from './models/transaction.model';
-import { TransactionService } from './transaction.service';
 
 @Global()
 @Module({
@@ -26,7 +25,6 @@ import { TransactionService } from './transaction.service';
     }),
     ObjectionModule.forFeature([User, Transaction]),
   ],
-  providers: [TransactionService],
-  exports: [ObjectionModule, TransactionService],
+  exports: [ObjectionModule],
 })
 export class DatabaseModule {}

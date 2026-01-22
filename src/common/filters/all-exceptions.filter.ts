@@ -7,7 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { FastifyReply, FastifyRequest } from 'fastify';
-import { ErrorCodes } from '../constants/error-codes';
+import { ErrorCodes, RETRYABLE_PG_ERRORS } from '../constants';
 
 interface ErrorResponse {
   code: string;
@@ -73,7 +73,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     if (exception instanceof Error && 'code' in exception) {
       const pgError = exception as Error & { code: string };
 
-      if (['40P01', '55P03', '57014'].includes(pgError.code)) {
+      if (RETRYABLE_PG_ERRORS.includes(pgError.code as typeof RETRYABLE_PG_ERRORS[number])) {
         return {
           status: HttpStatus.SERVICE_UNAVAILABLE,
           errorResponse: {
